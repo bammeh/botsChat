@@ -3,6 +3,16 @@
 import { createContext, useContext } from "react";
 import type { Agent as ApiAgent, Channel, Task, TaskWithChannel, Job, ModelInfo, Session } from "./api";
 
+export type Delegation = {
+  id: string;
+  runId: string;
+  childSessionKey: string;
+  sessionKey: string;
+  label?: string;
+  task?: string;
+  status: "running" | "completed";
+};
+
 export type ChatMessage = {
   id: string;
   sender: "user" | "agent";
@@ -52,6 +62,8 @@ export type AppState = {
   selectedCronTaskId: string | null;
   cronJobs: Job[];
   selectedCronJobId: string | null;
+  // Active delegations (sub-agents spawned via sessions_spawn)
+  delegations: Delegation[];
 };
 
 export const initialState: AppState = {
@@ -84,6 +96,7 @@ export const initialState: AppState = {
   selectedCronTaskId: null,
   cronJobs: [],
   selectedCronJobId: null,
+  delegations: [],
 };
 
 export type AppAction =
@@ -126,6 +139,9 @@ export type AppAction =
   | { type: "ADD_CRON_JOB"; job: Job }
   | { type: "UPDATE_CRON_JOB"; job: Job }
   | { type: "APPEND_JOB_OUTPUT"; jobId: string; text: string }
+  | { type: "ADD_DELEGATION"; delegation: Delegation }
+  | { type: "COMPLETE_DELEGATION"; runId: string }
+  | { type: "CLEAR_DELEGATIONS"; sessionKey?: string }
   | { type: "LOGOUT" };
 
 export function appReducer(state: AppState, action: AppAction): AppState {
@@ -169,6 +185,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         messages: sessionChanged ? [] : state.messages,
         activeThreadId: sessionChanged ? null : state.activeThreadId,
         threadMessages: sessionChanged ? [] : state.threadMessages,
+        delegations: sessionChanged ? [] : state.delegations,
       };
     }
     case "ADD_SESSION":
@@ -204,6 +221,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         messages: sessionChanged ? [] : state.messages,
         jobs: [],
         selectedJobId: null,
+        delegations: sessionChanged ? [] : state.delegations,
       };
     }
     case "SET_JOBS":
@@ -480,6 +498,29 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         cronJobs: updateSummary(state.cronJobs),
       };
     }
+    case "ADD_DELEGATION":
+      // Avoid duplicates when same delegation is parsed from both real-time and history
+      if (state.delegations.some((d) => d.runId === action.delegation.runId))
+        return state;
+      return {
+        ...state,
+        delegations: [...state.delegations, action.delegation],
+      };
+    case "COMPLETE_DELEGATION":
+      return {
+        ...state,
+        delegations: state.delegations.map((d) =>
+          d.runId === action.runId ? { ...d, status: "completed" as const } : d,
+        ),
+      };
+    case "CLEAR_DELEGATIONS":
+      if (action.sessionKey) {
+        return {
+          ...state,
+          delegations: state.delegations.filter((d) => d.sessionKey !== action.sessionKey),
+        };
+      }
+      return { ...state, delegations: [] };
     case "LOGOUT":
       return { ...initialState };
     default:

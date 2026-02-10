@@ -112,7 +112,16 @@ export type CloudOutbound =
   // Model changed — plugin notifies that /model command switched the active model
   | { type: "model.changed"; model: string; sessionKey: string }
   // Default model updated — plugin applied BotsChat default model to OpenClaw config
-  | { type: "defaultModel.updated"; model: string };
+  | { type: "defaultModel.updated"; model: string }
+  // Delegation — plugin parsed sessions_spawn tool result; sub-agent spawned
+  | {
+      type: "agent.delegation.spawned";
+      sessionKey: string;
+      runId: string;
+      childSessionKey: string;
+      label?: string;
+      task?: string;
+    };
 
 /** Cloud → Plugin (inbound, user messages) */
 export type CloudInbound =

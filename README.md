@@ -246,7 +246,13 @@ The plugin uses a JSON-based WebSocket protocol:
 | Direction          | Message Types                                                    |
 |--------------------|------------------------------------------------------------------|
 | Cloud → Plugin     | `user.message`, `user.action`, `user.command`, `task.schedule`, `task.delete`, `task.run`, `task.scan.request` |
-| Plugin → Cloud     | `agent.text`, `agent.media`, `agent.a2ui`, `agent.stream.*`, `job.update`, `job.output`, `task.scan.result`, `model.changed` |
+| Plugin → Cloud     | `agent.text`, `agent.media`, `agent.a2ui`, `agent.stream.*`, `agent.delegation.spawned`, `job.update`, `job.output`, `task.scan.result`, `model.changed` |
+
+### Sub-Agents / Delegation Cards
+
+When the agent spawns a sub-agent via `sessions_spawn`, BotsChat shows a **Delegation Card** with the task label and status. The plugin uses OpenClaw's `api.on("after_tool_call")` hook to detect `sessions_spawn` results and emit `agent.delegation.spawned` to the cloud.
+
+If delegation cards don't appear, ensure your OpenClaw version supports the `after_tool_call` plugin hook. Older versions fall back to parsing tool result text in the reply stream, which may require `agents.defaults.verboseDefault: "full"` in your config for reliable extraction.
 
 ### Uninstall
 

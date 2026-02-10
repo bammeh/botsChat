@@ -1,10 +1,16 @@
 import React, { useRef, useEffect, useState, useMemo, useCallback } from "react";
 import { useAppState, useAppDispatch, type ChatMessage } from "../store";
 import type { WSMessage } from "../ws";
+import { DelegationCard } from "./DelegationCard";
 import { MessageContent } from "./MessageContent";
 import { ModelSelect } from "./ModelSelect";
 import { SessionTabs } from "./SessionTabs";
 import { dlog } from "../debug-log";
+
+function getBaseSessionKey(sk: string | undefined): string {
+  if (!sk) return "";
+  return sk.replace(/:thread:.+$/, "");
+}
 
 type ChatWindowProps = {
   sendMessage: (msg: WSMessage) => void;
@@ -578,6 +584,16 @@ export function ChatWindow({ sendMessage }: ChatWindowProps) {
             />
           );
         })}
+        {sessionKey &&
+          state.delegations
+            .filter(
+              (d) => getBaseSessionKey(d.sessionKey) === getBaseSessionKey(sessionKey),
+            )
+            .map((d) => (
+              <div key={d.id} className="px-3 sm:px-5 py-2">
+                <DelegationCard delegation={d} />
+              </div>
+            ))}
         <div ref={messagesEndRef} />
       </div>
 

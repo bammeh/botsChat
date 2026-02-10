@@ -55,6 +55,122 @@ function getCloudClient(accountId: string): BotsChatCloudClient | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// Parse sessions_spawn / sub-agent spawn text — extract runId, childSessionKey, label
+// for delegation cards. Accepts both tool result format and agent announcement text
+// (e.g. "Sub-agent spawned... Session: agent:linear:subagent:uuid Run ID: uuid").
+// ---------------------------------------------------------------------------
+interface SessionsSpawnParsed {
+  runId: string;
+  childSessionKey: string;
+  label?: string;
+  task?: string;
+}
+
+function parseSessionsSpawnToolResult(text: string): SessionsSpawnParsed | null {
+  if (!text || typeof text !== "string") return null;
+  const trimmed = text.trim();
+
+  let runId = "";
+  let childSessionKey = "";
+  let label: string | undefined;
+  let task: string | undefined;
+
+  // Try JSON first (tool may return structured output)
+  try {
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    if (parsed.runId && typeof parsed.runId === "string") runId = parsed.runId;
+    if (parsed.childSessionKey && typeof parsed.childSessionKey === "string")
+      childSessionKey = parsed.childSessionKey;
+    if (parsed.label && typeof parsed.label === "string") label = parsed.label;
+    if (parsed.task && typeof parsed.task === "string") task = parsed.task;
+  } catch {
+    // Not JSON — use regex on formatted text
+    // Run ID: "run: x", "Run ID: x", "**Run ID:** `uuid`"
+    const runMatch = trimmed.match(/run(?:\s*id)?[:\s*]+[`\s]*([a-fA-F0-9][a-fA-F0-9_.-]{10,})/i);
+    if (runMatch) runId = runMatch[1].replace(/`\s*$/, "");
+
+    // Session key: agent:X:subagent:uuid (supports backticks in markdown)
+    const sessionMatch = trimmed.match(/agent:[^:\s]+:subagent:[a-fA-F0-9-]+/);
+    if (sessionMatch) childSessionKey = sessionMatch[0];
+
+    // Label: often in "label X" or parentheses
+    const labelMatch = trimmed.match(/label\s+([^\s•]+)/i) ?? trimmed.match(/\(([^)]+)\)/);
+    if (labelMatch) label = labelMatch[1].trim();
+  }
+
+  // Must have both runId and childSessionKey
+  // Accept if: spawn announcement pattern (sessions_spawn, sub-agent spawned, spawn initiated, Session Key:, etc.)
+  const hasSpawnSignature =
+    /sessions_spawn/i.test(trimmed) ||
+    /sub[- ]?agent\s+spawned/i.test(trimmed) ||
+    /spawn\s+initiated/i.test(trimmed) ||
+    /session(?:\s*key)?:?\s*`?agent:[^:\s]+:subagent:/i.test(trimmed) ||
+    (runId && childSessionKey && /agent:[^:\s]+:subagent:/i.test(trimmed));
+
+  if (runId && childSessionKey && hasSpawnSignature)
+    return { runId, childSessionKey, label, task };
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Parse sessions_spawn structured result (from api.on("after_tool_call"))
+// Returns { runId, childSessionKey, label?, task? } or null
+// ---------------------------------------------------------------------------
+function parseSessionsSpawnStructuredResult(result: unknown): SessionsSpawnParsed | null {
+  if (!result || typeof result !== "object") return null;
+  const r = result as Record<string, unknown>;
+  const runId = typeof r.runId === "string" ? r.runId : "";
+  const childSessionKey = typeof r.childSessionKey === "string" ? r.childSessionKey : "";
+  if (!runId || !childSessionKey) return null;
+  return {
+    runId,
+    childSessionKey,
+    label: typeof r.label === "string" ? r.label : undefined,
+    task: typeof r.task === "string" ? r.task : undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Extract BotsChat accountId from sessionKey.
+// Format: agent:main:botschat:accountId:... or agent:main:botschat:accountId:thread:...
+// ---------------------------------------------------------------------------
+function extractBotsChatAccountIdFromSessionKey(sessionKey: string): string | null {
+  if (!sessionKey || !sessionKey.includes(":botschat:")) return null;
+  const parts = sessionKey.split(":");
+  const botschatIdx = parts.indexOf("botschat");
+  if (botschatIdx < 0 || botschatIdx + 1 >= parts.length) return null;
+  return parts[botschatIdx + 1] ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Emit agent.delegation.spawned from after_tool_call hook.
+// Call from plugin register when api.on("after_tool_call") fires for sessions_spawn.
+// ---------------------------------------------------------------------------
+export function emitBotsChatDelegationFromToolResult(
+  sessionKey: string,
+  result: unknown,
+  log?: { info: (m: string) => void },
+): void {
+  const parsed = parseSessionsSpawnStructuredResult(result);
+  if (!parsed) return;
+  const accountId = extractBotsChatAccountIdFromSessionKey(sessionKey);
+  if (!accountId) return;
+  const client = getCloudClient(accountId);
+  if (!client?.connected) return;
+  client.send({
+    type: "agent.delegation.spawned",
+    sessionKey,
+    runId: parsed.runId,
+    childSessionKey: parsed.childSessionKey,
+    ...(parsed.label && { label: parsed.label }),
+    ...(parsed.task && { task: parsed.task }),
+  });
+  log?.info(
+    `[sessions_spawn] after_tool_call hook: emitted agent.delegation.spawned runId=${parsed.runId} sessionKey=${sessionKey}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // ChannelPlugin definition
 // ---------------------------------------------------------------------------
 
@@ -418,7 +534,7 @@ async function handleCloudMessage(
 
       // Create a reply dispatcher that sends responses back through the cloud WSS
       const client = getCloudClient(ctx.accountId);
-      const deliver = async (payload: { text?: string; mediaUrl?: string }) => {
+      const deliverBase = async (payload: { text?: string; mediaUrl?: string }) => {
         if (!client?.connected) return;
         if (payload.mediaUrl) {
           client.send({
@@ -480,10 +596,39 @@ async function handleCloudMessage(
       // Use dispatchReplyFromConfig with a simple dispatcher
       const { dispatcher, replyOptions, markDispatchIdle } =
         runtime.channel.reply.createReplyDispatcherWithTyping({
-          deliver: async (payload: unknown) => {
-            // The payload from the dispatcher is a ReplyPayload
+          deliver: async (payload: unknown, info?: { kind?: string }) => {
             const p = payload as { text?: string; mediaUrl?: string };
-            await deliver(p);
+            const kind = info?.kind ?? "(no kind)";
+            ctx.log?.info(
+              `[deliver] kind=${kind} hasText=${!!p.text} textLen=${(p.text ?? "").length} preview=${(p.text ?? "").slice(0, 120)}...`,
+            );
+            // Parse agent text for sessions_spawn / sub-agent announcements
+            // Tool results come as kind "tool"; agent replies come as "block" or "final"
+            const text = p.text;
+            const shouldParse = (kind === "tool" || kind === "block" || kind === "final") && !!text;
+            if (shouldParse && client?.connected && text) {
+              const parsed = parseSessionsSpawnToolResult(text);
+              if (parsed) {
+                ctx.log?.info(
+                  `[sessions_spawn] tool result received: runId=${parsed.runId} childSessionKey=${parsed.childSessionKey} label=${parsed.label ?? "(none)"} task=${parsed.task ? parsed.task.slice(0, 80) + (parsed.task.length > 80 ? "…" : "") : "(none)"}`,
+                );
+                client.send({
+                  type: "agent.delegation.spawned",
+                  sessionKey: msg.sessionKey,
+                  runId: parsed.runId,
+                  childSessionKey: parsed.childSessionKey,
+                  ...(parsed.label && { label: parsed.label }),
+                  ...(parsed.task && { task: parsed.task }),
+                });
+                ctx.log?.info(
+                  `[sessions_spawn] emitted agent.delegation.spawned to cloud runId=${parsed.runId} sessionKey=${msg.sessionKey}`,
+                );
+                // For tool results: don't duplicate as agent.text (card replaces it)
+                if (kind === "tool") return;
+                // For block/final: still show the agent's message
+              }
+            }
+            await deliverBase(p);
           },
           onTypingStart: () => {},
           onTypingStop: () => {},

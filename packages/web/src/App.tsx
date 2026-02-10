@@ -28,6 +28,7 @@ import { useIsMobile } from "./hooks/useIsMobile";
 import { MobileLayout } from "./components/MobileLayout";
 import { dlog } from "./debug-log";
 import { gtagPageView } from "./analytics";
+import { parseDelegationFromText } from "./utils/delegation-parse";
 
 export default function App() {
   const [state, dispatch] = useReducer(appReducer, initialState, (init): AppState => {
@@ -369,6 +370,26 @@ export default function App() {
         // Guard against stale responses when the user rapidly switches channels:
         // the cleanup function sets `stale = true` before the new effect runs.
         if (!stale) {
+          // Parse agent messages for delegation announcements (for history/reload)
+          for (const m of messages) {
+            if (m.sender === "agent" && m.text) {
+              const delegation = parseDelegationFromText(m.text);
+              if (delegation && state.selectedSessionKey) {
+                dispatch({
+                  type: "ADD_DELEGATION",
+                  delegation: {
+                    id: `del_${delegation.runId}`,
+                    runId: delegation.runId,
+                    childSessionKey: delegation.childSessionKey,
+                    sessionKey: state.selectedSessionKey,
+                    label: delegation.label,
+                    task: delegation.task,
+                    status: "running",
+                  },
+                });
+              }
+            }
+          }
           dispatch({ type: "SET_MESSAGES", messages, replyCounts });
         }
       })
@@ -480,10 +501,33 @@ export default function App() {
           // Skip messages for sessions we're not viewing — they'll be loaded
           // from the server when the user navigates to that session.
           if (!isCurrentSession(sessionKey)) break;
+          const text = msg.text as string;
+          dlog.info("Delegation", `agent.text len=${text.length} preview=${text.slice(0, 150)}...`);
+          // Parse agent text for sub-agent delegation announcements (plugin may not
+          // emit agent.delegation.spawned — e.g. if deliver callback isn't used)
+          const delegation = parseDelegationFromText(text);
+          dlog.info(
+            "Delegation",
+            delegation ? `parsed runId=${delegation.runId} childSessionKey=${delegation.childSessionKey?.slice(0, 36)}...` : "parse skip (no match)",
+          );
+          if (delegation && sessionKey) {
+            dispatch({
+              type: "ADD_DELEGATION",
+              delegation: {
+                id: `del_${delegation.runId}`,
+                runId: delegation.runId,
+                childSessionKey: delegation.childSessionKey,
+                sessionKey,
+                label: delegation.label,
+                task: delegation.task,
+                status: "running",
+              },
+            });
+          }
           const chatMsg: ChatMessage = {
             id: crypto.randomUUID(),
             sender: "agent",
-            text: msg.text as string,
+            text,
             timestamp: Date.now(),
             threadId,
           };
@@ -528,6 +572,27 @@ export default function App() {
           } else {
             dispatch({ type: "ADD_MESSAGE", message: a2uiMsg });
           }
+          break;
+        }
+
+        case "agent.delegation.spawned": {
+          dlog.info(
+            "Delegation",
+            `agent.delegation.spawned runId=${msg.runId} sessionKey=${msg.sessionKey} childSessionKey=${(msg.childSessionKey as string)?.slice(0, 36)}...`,
+          );
+          if (!isCurrentSession(msg.sessionKey as string)) break;
+          dispatch({
+            type: "ADD_DELEGATION",
+            delegation: {
+              id: `del_${msg.runId}`,
+              runId: msg.runId as string,
+              childSessionKey: msg.childSessionKey as string,
+              sessionKey: msg.sessionKey as string,
+              label: msg.label as string | undefined,
+              task: msg.task as string | undefined,
+              status: "running",
+            },
+          });
           break;
         }
 
