@@ -812,16 +812,12 @@ export class ConnectionDO implements DurableObject {
           // Schedule, instructions, and model are NOT stored in D1.
           // They belong to OpenClaw and are delivered to the frontend via this
           // task.scan.result WebSocket message (broadcast to browsers below).
-          const updateParts = [
-            "enabled = ?",
-            "updated_at = unixepoch()",
-          ];
-          const updateVals: unknown[] = [
+          const updateVals: (string | number)[] = [
             t.enabled ? 1 : 0,
-            t.cronJobId,
+            t.cronJobId ?? "",
           ];
           await this.env.DB.prepare(
-            `UPDATE tasks SET ${updateParts.join(", ")} WHERE openclaw_cron_job_id = ?`,
+            "UPDATE tasks SET enabled = ?, updated_at = unixepoch() WHERE openclaw_cron_job_id = ?",
           )
             .bind(...updateVals)
             .run();

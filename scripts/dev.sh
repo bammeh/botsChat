@@ -58,32 +58,39 @@ do_start() {
 }
 
 do_sync_plugin() {
-  local REMOTE_USER="mini.local"
-  local REMOTE_DIR="~/Projects/botsChat/packages/plugin"
+  local PLUGIN_DIR="/home/openclaw/.openclaw/botsChat/packages/plugin"
+  local EXT_DIR="/home/openclaw/.openclaw/extensions/botschat"
 
-  info "Syncing plugin to mini.local…"
-  rsync -avz --exclude node_modules --exclude .git --exclude dist --exclude .wrangler \
-    packages/plugin/ "$REMOTE_USER:$REMOTE_DIR/"
-  ok "Plugin files synced"
+  info "Building plugin locally…"
 
-  info "Building plugin, deploying to extensions, restarting gateway on mini.local…"
-  ssh "$REMOTE_USER" 'export PATH="/opt/homebrew/bin:$PATH"
-cd ~/Projects/botsChat/packages/plugin
-npm run build
-EXT_DIR=~/.openclaw/extensions/botschat
-rsync -av --delete dist/ "$EXT_DIR/dist/"
-rsync -av bin/ "$EXT_DIR/bin/" 2>/dev/null || true
-cp -f package.json openclaw.plugin.json "$EXT_DIR/" 2>/dev/null || true
-echo "--- Deployed to $EXT_DIR ---"
-pkill -9 -f openclaw-gateway 2>/dev/null || true
-sleep 3
-nohup openclaw gateway run --bind loopback --port 18789 --force > /tmp/openclaw-gateway.log 2>&1 &
-echo "Gateway restarted (PID=$!)"'
-  ok "Plugin synced, deployed to extensions, gateway restarted"
+  export PATH="/opt/homebrew/bin:$PATH"
+  cd "$PLUGIN_DIR" || exit 1
+
+  npm run build || exit 1
+
+  info "Deploying to extensions…"
+
+  rsync -av --delete dist/ "$EXT_DIR/dist/"
+  rsync -av bin/ "$EXT_DIR/bin/" 2>/dev/null || true
+  cp -f package.json openclaw.plugin.json "$EXT_DIR/" 2>/dev/null || true
+
+  echo "--- Deployed to $EXT_DIR ---"
+
+  info "Restarting OpenClaw gateway…"
+
+  pkill -9 -f openclaw-gateway 2>/dev/null || true
+  sleep 3
+
+  nohup openclaw gateway run --bind loopback --port 18789 --force \
+    > /tmp/openclaw-gateway.log 2>&1 &
+
+  echo "Gateway restarted (PID=$!)"
 
   sleep 4
   info "Checking connection…"
-  ssh "$REMOTE_USER" 'tail -5 /tmp/openclaw-gateway.log | grep -i "authenticated\|error\|Task scan"'
+  tail -5 /tmp/openclaw-gateway.log | grep -i "authenticated\|error\|Task scan"
+
+  ok "Plugin built, deployed, gateway restarted"
 }
 
 do_logs() {

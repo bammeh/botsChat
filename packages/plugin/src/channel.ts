@@ -5,6 +5,8 @@ import {
   resolveDefaultBotsChatAccountId,
   setBotsChatAccountEnabled,
 } from "./accounts.js";
+import { GatewayWsClient, GatewayEvent } from "./gateway-ws-client.js";
+import GatewayOperatorClient, { type EventMessage } from "./gateway-operator-client.js";
 import { getBotsChatRuntime } from "./runtime.js";
 import type { BotsChatChannelConfig, CloudInbound, ResolvedBotsChatAccount } from "./types.js";
 import { BotsChatCloudClient } from "./ws-client.js";
@@ -43,6 +45,151 @@ function readAgentModel(_agentId: string): string | undefined {
   return undefined;
 }
 
+// Gateway event data interface for type safety
+interface GatewayEventData {
+  text?: string;
+  phase?: string;
+  name?: string;
+  result?: unknown;
+  sessionKey?: string;
+  runId?: string;
+  childSessionKey?: string;
+  label?: string;
+  task?: string;
+}
+
+// Type guard to check if data has text property
+function hasText(data: unknown): data is GatewayEventData {
+  return typeof data === "object" && data !== null && "text" in data;
+}
+
+// Type guard to check if data has phase property
+function hasPhase(data: unknown): data is GatewayEventData {
+  return typeof data === "object" && data !== null && "phase" in data;
+}
+
+// Type guard to check if data has name property
+function hasName(data: unknown): data is GatewayEventData {
+  return typeof data === "object" && data !== null && "name" in data;
+}
+
+// Type guard to check if data has result property
+function hasResult(data: unknown): data is GatewayEventData {
+  return typeof data === "object" && data !== null && "result" in data;
+}
+
+// ---------------------------------------------------------------------------
+// Gateway event handler — handles streaming events from GatewayWsClient and GatewayOperatorClient
+// Forwards events to cloud client for delivery to BotsChat cloud
+// ---------------------------------------------------------------------------
+function handleGatewayEvent(
+  frame: GatewayEvent | EventMessage,
+  accountId: string,
+  log?: { info: (m: string) => void; warn: (m: string) => void; error: (m: string) => void },
+): void {
+  // Only process agent events
+  if (frame.type !== "event" || frame.event !== "agent") return;
+
+  const payload = frame.payload;
+  const stream = payload?.stream;
+  const data = payload?.data as GatewayEventData | Record<string, unknown> | undefined;
+
+  const client = getCloudClient(accountId);
+  if (!client?.connected) return;
+
+  // Extract sessionKey from payload or data
+  const sessionKey = (payload as Record<string, unknown>)?.sessionKey as string | undefined
+    ?? (data as Record<string, unknown>)?.sessionKey as string | undefined;
+
+  // Extract runId from payload or data
+  const runId = (payload as Record<string, unknown>)?.runId as string | undefined
+    ?? (data as Record<string, unknown>)?.runId as string | undefined;
+
+  if (!sessionKey) {
+    log?.warn(`[GatewayWsClient] Event without sessionKey: stream=${stream}`);
+    return;
+  }
+
+  // Handle reply stream events (agent text responses)
+  if (stream === "reply") {
+    // Safely extract text and phase with type guards
+    const text = hasText(data) ? data.text : undefined;
+    const phase = hasPhase(data) ? data.phase : undefined;
+
+    if (phase === "start" && runId) {
+      client.send({
+        type: "agent.stream.start",
+        sessionKey,
+        runId,
+      });
+    } else if (text && runId) {
+      client.send({
+        type: "agent.stream.chunk",
+        sessionKey,
+        runId,
+        text,
+      });
+    } else if (phase === "result") {
+      // Final text - send as agent.text
+      if (text) {
+        client.send({
+          type: "agent.text",
+          sessionKey,
+          text,
+        });
+      }
+      if (runId) {
+        client.send({
+          type: "agent.stream.end",
+          sessionKey,
+          runId,
+        });
+      }
+    }
+
+    log?.info(`[GatewayWsClient] Reply event: phase=${phase ?? "(none)"} hasText=${!!text}`);
+    return;
+  }
+
+  // Handle tool result events
+  if (stream === "tool") {
+    const phase = hasPhase(data) ? data.phase : undefined;
+    if (phase === "result") {
+      const name = hasName(data) ? data.name : undefined;
+      const result = hasResult(data) ? data.result : undefined;
+
+      log?.info(
+        `[GatewayWsClient] Tool result: name=${name ?? "(unknown)"} hasResult=${!!result}`,
+      );
+
+      if (name === "sessions_spawn") {
+        // Parse result to extract runId, childSessionKey, label
+        const typedResult = result as Record<string, unknown> | undefined;
+        if (typedResult && typeof typedResult === "object") {
+          const toolRunId = typedResult.runId as string | undefined;
+          const childSessionKey = typedResult.childSessionKey as string | undefined;
+          const label = typedResult.label as string | undefined;
+          const task = typedResult.task as string | undefined;
+
+          if (toolRunId && childSessionKey) {
+            client.send({
+              type: "agent.delegation.spawned",
+              sessionKey,
+              runId: toolRunId,
+              childSessionKey,
+              ...(label && { label }),
+              ...(task && { task }),
+            });
+            log?.info(
+              `[GatewayWsClient] Emitted agent.delegation.spawned: runId=${toolRunId} child=${childSessionKey}`,
+            );
+          }
+        }
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Connection registry — maps accountId → live WSS client
 // ---------------------------------------------------------------------------
@@ -50,8 +197,26 @@ const cloudClients = new Map<string, BotsChatCloudClient>();
 /** Maps accountId → cloudUrl so handleCloudMessage can resolve relative URLs */
 const cloudUrls = new Map<string, string>();
 
+// ---------------------------------------------------------------------------
+// Gateway WebSocket registry — maps accountId → GatewayWsClient for RPC calls
+// ---------------------------------------------------------------------------
+const gatewayClients = new Map<string, GatewayWsClient>();
+
+// ---------------------------------------------------------------------------
+// Gateway Operator Client registry — maps accountId → GatewayOperatorClient for proper Gateway protocol
+// ---------------------------------------------------------------------------
+const gatewayOperatorClients = new Map<string, GatewayOperatorClient>();
+
 function getCloudClient(accountId: string): BotsChatCloudClient | undefined {
   return cloudClients.get(accountId);
+}
+
+function getGatewayClient(accountId: string): GatewayWsClient | undefined {
+  return gatewayClients.get(accountId);
+}
+
+function getGatewayOperatorClient(accountId: string): GatewayOperatorClient | undefined {
+  return gatewayOperatorClients.get(accountId);
 }
 
 // ---------------------------------------------------------------------------
@@ -326,10 +491,44 @@ export const botschatPlugin = {
       cloudUrls.set(accountId, account.cloudUrl);
       client.connect();
 
+      // Create and connect GatewayOperatorClient for proper Gateway protocol
+      const logWrapper = {
+        info: (...args: unknown[]) => log?.info(...args as [string]),
+        warn: (...args: unknown[]) => log?.warn(...args as [string]),
+        error: (...args: unknown[]) => log?.error(...args as [string]),
+      };
+
+      const gatewayOperatorClient = new GatewayOperatorClient({
+        accountId,
+        onEvent: (frame) => handleGatewayEvent(frame, accountId, log),
+        onExecApproval: (request) => {
+          log?.info(`[${accountId}] Exec approval request: ${request.method} sessionKey=${request.params.sessionKey}`);
+          // Handle exec approval requests if needed
+        },
+        onConnected: () => log?.info(`[${accountId}] Gateway Operator connected (device=${gatewayOperatorClient.deviceId})`),
+        onDisconnected: (reason) => log?.warn(`[${accountId}] Gateway Operator disconnected: ${reason ?? "unknown"}`),
+        log: logWrapper,
+        // Optional: Only log warnings for specific response IDs (supports wildcards)
+        // Examples: ["d5a123c6-c059-4ea5-bc1b-*"] or ["logs.tail", "node.list"]
+        // Omit this property or set to empty array to log all unknown responses
+        logUnknownResponseIds: [],
+      });
+
+      gatewayOperatorClients.set(accountId, gatewayOperatorClient);
+
+      // Attempt to connect (non-blocking - will retry in background)
+      gatewayOperatorClient.connect().catch((err) => {
+        log?.warn(`[${accountId}] Gateway Operator connection failed: ${err}. Will use fallback.`);
+      });
+
       ctx.abortSignal.addEventListener("abort", () => {
         client.disconnect();
         cloudClients.delete(accountId);
         cloudUrls.delete(accountId);
+
+        // Cleanup gateway operator client
+        gatewayOperatorClient.disconnect();
+        gatewayOperatorClients.delete(accountId);
       });
 
       return client;
@@ -345,6 +544,14 @@ export const botschatPlugin = {
         client.disconnect();
         cloudClients.delete(ctx.accountId);
       }
+
+      // Cleanup gateway operator client
+      const gatewayOperatorClient = gatewayOperatorClients.get(ctx.accountId);
+      if (gatewayOperatorClient) {
+        gatewayOperatorClient.disconnect();
+        gatewayOperatorClients.delete(ctx.accountId);
+      }
+
       ctx.setStatus({
         ...ctx.getStatus(),
         running: false,
@@ -512,7 +719,7 @@ async function handleCloudMessage(
           Surface: "botschat",
           CommandAuthorized: true,
           // A2UI format instructions are injected via agentPrompt.messageToolHints
-          // (inside the message tool docs in the system prompt) — no GroupSystemPrompt needed.
+          // (inside the message tool docs in system prompt) — no GroupSystemPrompt needed.
           ...(threadId ? { MessageThreadId: threadId, ReplyToId: threadId } : {}),
           // Include image URL if the user sent an image.
           // Resolve relative URLs (e.g. /api/media/...) to absolute using cloudUrl
@@ -534,127 +741,165 @@ async function handleCloudMessage(
 
       // Create a reply dispatcher that sends responses back through the cloud WSS
       const client = getCloudClient(ctx.accountId);
-      const deliverBase = async (payload: { text?: string; mediaUrl?: string }) => {
-        if (!client?.connected) return;
-        if (payload.mediaUrl) {
-          client.send({
-            type: "agent.media",
+      const gatewayOperatorClient = getGatewayOperatorClient(ctx.accountId);
+
+      // --- Gateway RPC path (primary) ---
+      // Use GatewayOperatorClient to send chat.send RPC. Events stream via onEvent callback.
+      if (gatewayOperatorClient?.ready) {
+        try {
+          ctx.log?.info(`[${ctx.accountId}] Using gateway RPC for chat.send`);
+
+          const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+          // Send chat.send RPC via gateway WebSocket
+          // The gateway will run the agent and stream events back via onEvent
+          const response = await gatewayOperatorClient.send("chat.send", {
             sessionKey: msg.sessionKey,
-            mediaUrl: payload.mediaUrl,
-            caption: payload.text,
+            body: msg.text,
+            mediaUrl: msg.mediaUrl
+              ? (msg.mediaUrl.startsWith("/")
+                ? cloudUrls.get(ctx.accountId)?.replace(/\/$/, "") + msg.mediaUrl
+                : msg.mediaUrl)
+              : undefined,
             threadId,
+            verboseLevel: "full", // Ensure tool results are included
+            runId,
           });
-        } else if (payload.text) {
-          client.send({
-            type: "agent.text",
-            sessionKey: msg.sessionKey,
-            text: payload.text,
-            threadId,
-          });
-          // Detect model-change confirmations and emit model.changed
-          // Handles both formats:
-          //   "Model set to provider/model."  (no parentheses)
-          //   "Model set to Friendly Name (provider/model)."  (with parentheses)
-          const modelMatch = payload.text.match(
-            /Model (?:set to|reset to default)\b.*?([a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*\/[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*)/,
-          );
-          if (modelMatch) {
+
+          ctx.log?.info(`[${ctx.accountId}] Gateway RPC completed: ${JSON.stringify(response).slice(0, 200)}`);
+        } catch (gatewayErr) {
+          ctx.log?.warn(`[${ctx.accountId}] Gateway RPC failed, falling back to in-process: ${gatewayErr}`);
+          // Fall through to fallback below
+        }
+      } else {
+        ctx.log?.info(`[${ctx.accountId}] Gateway not ready, using in-process dispatch`);
+      }
+
+      // --- Fallback: in-process dispatch via dispatchReplyFromConfig ---
+      // Used when gateway is not connected or RPC failed
+      if (!gatewayOperatorClient?.ready) {
+        const deliverBase = async (payload: { text?: string; mediaUrl?: string }) => {
+          if (!client?.connected) return;
+          if (payload.mediaUrl) {
             client.send({
-              type: "model.changed",
-              model: modelMatch[1],
+              type: "agent.media",
               sessionKey: msg.sessionKey,
+              mediaUrl: payload.mediaUrl,
+              caption: payload.text,
+              threadId,
+            });
+          } else if (payload.text) {
+            client.send({
+              type: "agent.text",
+              sessionKey: msg.sessionKey,
+              text: payload.text,
+              threadId,
+            });
+            // Detect model-change confirmations and emit model.changed
+            // Handles both formats:
+            //   "Model set to provider/model."  (no parentheses)
+            //   "Model set to Friendly Name (provider/model)."  (with parentheses)
+            const modelMatch = payload.text.match(
+              /Model (?:set to|reset to default)\b.*?([a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*\/[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*)/,
+            );
+            if (modelMatch) {
+              client.send({
+                type: "model.changed",
+                model: modelMatch[1],
+                sessionKey: msg.sessionKey,
+              });
+            }
+          }
+        };
+
+        // --- Streaming support ---
+        // Generate a runId to correlate stream events for this reply.
+        const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        let streamStarted = false;
+
+        const onPartialReply = (payload: { text?: string }) => {
+          if (!client?.connected || !payload.text) return;
+          // Send stream start on first chunk
+          if (!streamStarted) {
+            streamStarted = true;
+            client.send({
+              type: "agent.stream.start",
+              sessionKey: msg.sessionKey,
+              runId,
             });
           }
-        }
-      };
-
-      // --- Streaming support ---
-      // Generate a runId to correlate stream events for this reply.
-      const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      let streamStarted = false;
-
-      const onPartialReply = (payload: { text?: string }) => {
-        if (!client?.connected || !payload.text) return;
-        // Send stream start on first chunk
-        if (!streamStarted) {
-          streamStarted = true;
+          // Send the accumulated text so far
           client.send({
-            type: "agent.stream.start",
+            type: "agent.stream.chunk",
+            sessionKey: msg.sessionKey,
+            runId,
+            text: payload.text,
+          });
+        };
+
+        // Use dispatchReplyFromConfig with a simple dispatcher
+        const { dispatcher, replyOptions, markDispatchIdle } =
+          runtime.channel.reply.createReplyDispatcherWithTyping({
+            deliver: async (payload: unknown, info?: { kind?: string }) => {
+              const p = payload as { text?: string; mediaUrl?: string };
+              const kind = info?.kind ?? "(no kind)";
+              ctx.log?.info(
+                `[deliver] kind=${kind} hasText=${!!p.text} textLen=${(p.text ?? "").length} preview=${(p.text ?? "").slice(0, 120)}...`,
+              );
+              // Parse agent text for sessions_spawn / sub-agent announcements
+              // Tool results come as kind "tool"; agent replies come as "block" or "final"
+              const text = p.text;
+              const shouldParse = (kind === "tool" || kind === "block" || kind === "final") && !!text;
+              if (shouldParse && client?.connected && text) {
+                const parsed = parseSessionsSpawnToolResult(text);
+                if (parsed) {
+                  ctx.log?.info(
+                    `[sessions_spawn] tool result received: runId=${parsed.runId} childSessionKey=${parsed.childSessionKey} label=${parsed.label ?? "(none)"} task=${parsed.task ? parsed.task.slice(0, 80) + (parsed.task.length > 80 ? "…" : "") : "(none)"}`,
+                  );
+                  client.send({
+                    type: "agent.delegation.spawned",
+                    sessionKey: msg.sessionKey,
+                    runId: parsed.runId,
+                    childSessionKey: parsed.childSessionKey,
+                    ...(parsed.label && { label: parsed.label }),
+                    ...(parsed.task && { task: parsed.task }),
+                  });
+                  ctx.log?.info(
+                    `[sessions_spawn] emitted agent.delegation.spawned to cloud runId=${parsed.runId} sessionKey=${msg.sessionKey}`,
+                  );
+                  // For tool results: don't duplicate as agent.text (card replaces it)
+                  if (kind === "tool") return;
+                  // For block/final: still show the agent's message
+                }
+              }
+              await deliverBase(p);
+            },
+            onTypingStart: () => {},
+            onTypingStop: () => {},
+          });
+
+        await runtime.channel.reply.dispatchReplyFromConfig({
+          ctx: finalizedCtx,
+          cfg,
+          dispatcher,
+          replyOptions: {
+            ...replyOptions,
+            onPartialReply,
+            allowPartialStream: true,
+          },
+        });
+
+        // Send stream end if streaming was active
+        if (streamStarted && client?.connected) {
+          client.send({
+            type: "agent.stream.end",
             sessionKey: msg.sessionKey,
             runId,
           });
         }
-        // Send the accumulated text so far
-        client.send({
-          type: "agent.stream.chunk",
-          sessionKey: msg.sessionKey,
-          runId,
-          text: payload.text,
-        });
-      };
 
-      // Use dispatchReplyFromConfig with a simple dispatcher
-      const { dispatcher, replyOptions, markDispatchIdle } =
-        runtime.channel.reply.createReplyDispatcherWithTyping({
-          deliver: async (payload: unknown, info?: { kind?: string }) => {
-            const p = payload as { text?: string; mediaUrl?: string };
-            const kind = info?.kind ?? "(no kind)";
-            ctx.log?.info(
-              `[deliver] kind=${kind} hasText=${!!p.text} textLen=${(p.text ?? "").length} preview=${(p.text ?? "").slice(0, 120)}...`,
-            );
-            // Parse agent text for sessions_spawn / sub-agent announcements
-            // Tool results come as kind "tool"; agent replies come as "block" or "final"
-            const text = p.text;
-            const shouldParse = (kind === "tool" || kind === "block" || kind === "final") && !!text;
-            if (shouldParse && client?.connected && text) {
-              const parsed = parseSessionsSpawnToolResult(text);
-              if (parsed) {
-                ctx.log?.info(
-                  `[sessions_spawn] tool result received: runId=${parsed.runId} childSessionKey=${parsed.childSessionKey} label=${parsed.label ?? "(none)"} task=${parsed.task ? parsed.task.slice(0, 80) + (parsed.task.length > 80 ? "…" : "") : "(none)"}`,
-                );
-                client.send({
-                  type: "agent.delegation.spawned",
-                  sessionKey: msg.sessionKey,
-                  runId: parsed.runId,
-                  childSessionKey: parsed.childSessionKey,
-                  ...(parsed.label && { label: parsed.label }),
-                  ...(parsed.task && { task: parsed.task }),
-                });
-                ctx.log?.info(
-                  `[sessions_spawn] emitted agent.delegation.spawned to cloud runId=${parsed.runId} sessionKey=${msg.sessionKey}`,
-                );
-                // For tool results: don't duplicate as agent.text (card replaces it)
-                if (kind === "tool") return;
-                // For block/final: still show the agent's message
-              }
-            }
-            await deliverBase(p);
-          },
-          onTypingStart: () => {},
-          onTypingStop: () => {},
-        });
-
-      await runtime.channel.reply.dispatchReplyFromConfig({
-        ctx: finalizedCtx,
-        cfg,
-        dispatcher,
-        replyOptions: {
-          ...replyOptions,
-          onPartialReply,
-          allowPartialStream: true,
-        },
-      });
-
-      // Send stream end if streaming was active
-      if (streamStarted && client?.connected) {
-        client.send({
-          type: "agent.stream.end",
-          sessionKey: msg.sessionKey,
-          runId,
-        });
+        markDispatchIdle();
       }
-
-      markDispatchIdle();
       } catch (err) {
         ctx.log?.error(`[${ctx.accountId}] Failed to dispatch message: ${err}`);
       }
@@ -1289,7 +1534,7 @@ async function readCronRunLog(
 
 /**
  * Layer 2 — CLI fallback: `openclaw cron runs --id <jobId> --limit <n>`.
- * Uses the Gateway RPC under the hood, returns the same data as Layer 1.
+ * Uses Gateway RPC under the hood, returns the same data as Layer 1.
  */
 async function readCronRunLogViaCli(
   jobId: string,
@@ -1680,5 +1925,3 @@ async function handleTaskScanRequest(
     client.send({ type: "task.scan.result", tasks: [] });
   }
 }
-
-
